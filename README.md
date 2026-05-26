@@ -1,3 +1,4 @@
+![Logo](ewv-logo.png)
 ⚠️ Note on EWW
 EWV (Enhanced Widget Vanguard) is NOT a fork, an extension, or a wrapper for eww.
 
