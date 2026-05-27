@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+import xml.etree.ElementTree as ET
+import sys
+import os
+import subprocess
+
+def parse_widget_xml(widget_name):
+    # Costruiamo il percorso del file config.xml
+    user = os.getenv("USER")
+    xml_path = f"/home/{user}/.config/ewv/{widget_name}/config.xml"
+    
+    if not os.path.exists(xml_path):
+        print(f"[-] Error: XML config not found at {xml_path}")
+        sys.exit(1)
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        
+        # Estraiamo i dati base (esempio: larghezza, altezza, opacità)
+        # Puoi aggiungere tutti i tag che servono al tuo Engine C
+        config_data = {
+            "name": widget_name,
+            "width": root.find('width').text if root.find('width') is not None else "400",
+            "height": root.find('height').text if root.find('height') is not None else "250",
+            "opacity": root.get('opacity', '1.0'),
+        }
+        return config_data
+
+    except ET.ParseError as e:
+        print(f"[-] XML Syntax Error: {e}")
+        sys.exit(1)
+
+def main():
+    if len(sys.argv) < 2:
+        print("[-] Usage: ewv-xml-provider [widget_name]")
+        sys.exit(1)
+
+    widget_name = sys.argv[1]
+    
+    # 1. Parsing dei dati XML
+    data = parse_widget_xml(widget_name)
+    
+    # 2. Prepariamo il comando per l'Engine C
+    # Passiamo i dati come argomenti o come variabili d'ambiente
+    engine_bin = "/usr/local/bin/ewv-engine" # O dove tieni il binario
+    
+    cmd = [
+        engine_bin,
+        "--name", data['name'],
+        "--width", data['width'],
+        "--height", data['height'],
+        "--opacity", data['opacity']
+    ]
+
+    # 3. Avvio dell'Engine
+    try:
+        # Usiamo os.execv per sostituire il processo Python con l'Engine C
+        # Questo mantiene il PID gestito dal Launcher originale
+        os.execv(engine_bin, cmd)
+    except FileNotFoundError:
+        print(f"[-] Fatal: Engine binary not found at {engine_bin}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

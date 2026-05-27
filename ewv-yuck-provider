@@ -1,0 +1,182 @@
+#!/usr/bin/python3
+import os, sys, re, json, subprocess
+
+# 1. Setup percorsi
+if len(sys.argv) < 2:
+    sys.exit(1)
+
+WIDGET = sys.argv[1]
+PATH = os.path.expanduser(f"~/.config/ewv/{WIDGET}/")
+CONFIG_PATH = os.path.join(PATH, "config.yuck")
+
+# 2. Carica il file yuck
+try:
+    with open(CONFIG_PATH, 'r') as f:
+        content = f.read()
+except FileNotFoundError:
+    print(f"[ERRORE] File non trovato: {CONFIG_PATH}", file=sys.stderr)
+    sys.exit(1)
+
+# 3. Compila il CSS
+css_out = f"/tmp/ewv_{WIDGET}.css"
+if os.path.exists(os.path.join(PATH, "style.scss")):
+    subprocess.run(['sassc', os.path.join(PATH, "style.scss"), css_out], capture_output=True)
+
+# =====================================================================
+# 4. IL MOTORE DI PARSING (S-Expressions Lisp-style)
+# =====================================================================
+
+def tokenize(s):
+    # Rimuove i commenti che iniziano con ;
+    s = re.sub(r';.*', '', s)
+    # Riconosce stringhe tra virgolette, parentesi e parole chiave
+    token_spec = [
+        ('STRING',  r'"[^"\\]*(?:\\.[^"\\]*)*"'),
+        ('LPAREN',  r'\('),
+        ('RPAREN',  r'\)'),
+        ('WORD',    r'[^\s()]+'),
+    ]
+    tok_regex = '|'.join(f'(?P<{name}>{reg})' for name, reg in token_spec)
+    tokens = []
+    for mo in re.finditer(tok_regex, s):
+        kind = mo.lastgroup
+        val = mo.group(kind)
+        if kind == 'STRING':
+            val = val[1:-1]  # Rimuove le virgolette esterne della stringa
+        tokens.append((kind, val))
+    return tokens
+
+def parse_s_expr(tokens):
+    if not tokens:
+        return None
+    token = tokens.pop(0)
+    if token[0] == 'LPAREN':
+        L = []
+        while tokens and tokens[0][0] != 'RPAREN':
+            L.append(parse_s_expr(tokens))
+        if tokens:
+            tokens.pop(0)  # Rimuove la parentesi chiusa 'RPAREN'
+        return L
+    else:
+        return token[1]
+
+def parse_all(tokens):
+    expressions = []
+    while tokens:
+        expr = parse_s_expr(tokens)
+        if expr:
+            expressions.append(expr)
+    return expressions
+
+# =====================================================================
+# 5. GENERATORE DELL'ALBERO GERARCHICO JSON
+# =====================================================================
+
+def parse_widget(sexpr):
+    # Se non è una lista, è un valore testuale puro o una foglia
+    if not isinstance(sexpr, list):
+        return sexpr
+    if not sexpr:
+        return None
+        
+    node_type = sexpr[0]
+    node = {"type": node_type}
+    children = []
+    
+    i = 1
+    while i < len(sexpr):
+        item = sexpr[i]
+        # Se inizia con un due punti (es: :orientation), è una proprietà del widget attuale
+        if isinstance(item, str) and item.startswith(':'):
+            key = item[1:]  # Togliamo il ':' dal nome della chiave
+            val = sexpr[i+1] if i + 1 < len(sexpr) else True
+            
+            # Normalizzazione automatica dei pixel (es: "300px" -> 300)
+            if isinstance(val, str):
+                val_clean = val.replace('px', '')
+                if val_clean.isdigit():
+                    val = int(val_clean)
+                    
+            node[key] = val
+            i += 2
+        else:
+            # Altrimenti, è un widget figlio annidato all'interno
+            child_parsed = parse_widget(item)
+            if child_parsed is not None:
+                children.append(child_parsed)
+            i += 1
+            
+    if children:
+        node["children"] = children
+    return node
+
+def parse_window(sexpr):
+    window_name = sexpr[1]
+    window_data = {
+        "name": window_name,
+        "w": 300, "h": 260, "x": 0, "y": 0, "layer": 0, "exclusive": False
+    }
+    
+    i = 2
+    widget_sexpr = None
+    while i < len(sexpr):
+        item = sexpr[i]
+        if isinstance(item, str) and item.startswith(':'):
+            key = item[1:]
+            val = sexpr[i+1]
+            if key == 'geometry':
+                geom = parse_widget(val)
+                if 'x' in geom: window_data['x'] = geom['x']
+                if 'y' in geom: window_data['y'] = geom['y']
+                if 'width' in geom: window_data['w'] = geom['width']
+                if 'height' in geom: window_data['h'] = geom['height']
+            elif key == 'stacking':
+                window_data['layer'] = 0 if val == 'background' else 1
+            elif key == 'exclusive':
+                window_data['exclusive'] = (val == 'true' or val is True)
+            i += 2
+        else:
+            widget_sexpr = item
+            i += 1
+            
+    if widget_sexpr:
+        window_data['tree'] = parse_widget(widget_sexpr)
+    return window_data
+
+# =====================================================================
+# 6. ESECUZIONE ED EXPORT VERSO L'ENGINE IN C
+# =====================================================================
+
+# Generiamo i token ed estraiamo l'albero sintattico
+tokens = tokenize(content)
+parsed_expressions = parse_all(tokens)
+
+window_config = None
+for expr in parsed_expressions:
+    if isinstance(expr, list) and expr[0] == 'defwindow':
+        window_config = parse_window(expr)
+        break
+
+if not window_config:
+    print("[ERRORE] Nessuna 'defwindow' trovata nel file yuck!", file=sys.stderr)
+    sys.exit(1)
+
+# Impacchettiamo il super JSON con l'albero strutturato dei widget
+widget_data = {
+    "w": window_config["w"],
+    "h": window_config["h"],
+    "x": window_config["x"],
+    "y": window_config["y"],
+    "layer": window_config["layer"],
+    "app_id": f"com.matti.ewv.{WIDGET}",
+    "css_path": css_out,
+    "tree": window_config.get("tree", {})  # <--- QUI DENTRO C'È TUTTO L'ALBERO!
+}
+
+# Super log di debug per farti vedere la struttura dell'albero generato
+print("[LANCIO ENGINE - ALBERO COMPLETO VIA JSON]", file=sys.stderr)
+print(json.dumps(widget_data, indent=2, ensure_ascii=False), file=sys.stderr)
+
+# 7. Lancio diretto passando il mega blocco JSON strutturato
+engine_path = os.path.expanduser("/usr/local/lib/ewv/ewv-engine")
+os.execv(engine_path, ["ewv-engine", json.dumps(widget_data)])
